@@ -29,7 +29,7 @@ def transform(df):
     df.columns = [c.strip() for c in df.columns]
     col_fundo, col_nav, col_data = df.columns[0], df.columns[1], df.columns[2]
     print(f"Colunas: fundo={col_fundo}, nav={col_nav}, data={col_data}")
-    mask = df[col_fundo].str.strip().isin(["SGF DR FINANCAS", "SGF DR FINAN\u00c7AS"])
+    mask = df[col_fundo].str.strip().isin(["SGF DR FINANCAS", "SGF DR FINANÇAS"])
     df_filtered = df[mask].copy()
     print(f"Registos apos filtro: {len(df_filtered)}")
     if df_filtered.empty:
@@ -43,6 +43,7 @@ def transform(df):
     before = len(df_out)
     df_out = df_out.dropna(subset=["nav", "data"])
     print(f"Removidas {before - len(df_out)} linhas nulas. Total: {len(df_out)}")
+    df_out = df_out.sort_values("data", ascending=False).reset_index(drop=True)
     return df_out
 
 
