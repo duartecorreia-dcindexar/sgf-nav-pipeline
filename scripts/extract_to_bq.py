@@ -1,5 +1,6 @@
 import os
 import io
+import time
 import requests
 import pandas as pd
 from datetime import datetime, timezone
@@ -12,17 +13,24 @@ DATASET = "golden_sgf"
 TABLE = "sgf_dr_financas_nav"
 TABLE_REF = f"{PROJECT_ID}.{DATASET}.{TABLE}"
 
-client = bigquery.Client(project=PROJECT_ID)
 
-
-def download_excel(url):
-    print(f"A descarregar Excel de: {url}")
-    headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(url, headers=headers, timeout=60)
-    response.raise_for_status()
-    df = pd.read_excel(io.BytesIO(response.content), engine="openpyxl")
-    print(f"Excel carregado: {len(df)} linhas, colunas: {list(df.columns)}")
-    return df
+def download_excel(url, retries=3):
+    for attempt in range(retries):
+        try:
+            print(f"A descarregar Excel de: {url} (tentativa {attempt + 1}/{retries})")
+            headers = {"User-Agent": "Mozilla/5.0"}
+            response = requests.get(url, headers=headers, timeout=60)
+            response.raise_for_status()
+            df = pd.read_excel(io.BytesIO(response.content), engine="openpyxl")
+            print(f"Excel carregado: {len(df)} linhas, colunas: {list(df.columns)}")
+            return df
+        except Exception as e:
+            print(f"Erro na tentativa {attempt + 1}: {e}")
+            if attempt < retries - 1:
+                print("A aguardar 10 segundos antes de repetir...")
+                time.sleep(10)
+            else:
+                raise
 
 
 def transform(df):
@@ -47,7 +55,7 @@ def transform(df):
     return df_out
 
 
-def ensure_dataset_and_table():
+def ensure_dataset_and_table(client):
     dataset_ref = bigquery.Dataset(f"{PROJECT_ID}.{DATASET}")
     dataset_ref.location = "EU"
     try:
@@ -71,7 +79,7 @@ def ensure_dataset_and_table():
         print(f"Tabela '{TABLE}' criada.")
 
 
-def load_to_bq(df):
+def load_to_bq(client, df):
     job_config = bigquery.LoadJobConfig(
         schema=[
             bigquery.SchemaField("data", "DATE"),
@@ -89,10 +97,11 @@ def load_to_bq(df):
 
 
 def main():
+    client = bigquery.Client(project=PROJECT_ID)
     df_raw = download_excel(EXCEL_URL)
     df_clean = transform(df_raw)
-    ensure_dataset_and_table()
-    load_to_bq(df_clean)
+    ensure_dataset_and_table(client)
+    load_to_bq(client, df_clean)
 
 
 if __name__ == "__main__":
