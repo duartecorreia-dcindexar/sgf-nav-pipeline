@@ -5,15 +5,15 @@ import requests
 import pandas as pd
 from datetime import datetime, timezone
 from google.cloud import bigquery
-
+ 
 EXCEL_URL = "https://goldensgf.pt/wp-content/uploads/2024/08/HISTORICO-DE-COTACOES.xlsx"
 FUND_NAME = "SGF DR FINANCAS"
 PROJECT_ID = os.environ["GCP_PROJECT_ID"]
-DATASET = "golden_sgf"
+DATASET = "PPR_SGF_DF"
 TABLE = "sgf_dr_financas_nav"
 TABLE_REF = f"{PROJECT_ID}.{DATASET}.{TABLE}"
-
-
+ 
+ 
 def download_excel(url, retries=3):
     for attempt in range(retries):
         try:
@@ -31,8 +31,8 @@ def download_excel(url, retries=3):
                 time.sleep(10)
             else:
                 raise
-
-
+ 
+ 
 def transform(df):
     df.columns = [c.strip() for c in df.columns]
     col_fundo, col_nav, col_data = df.columns[0], df.columns[1], df.columns[2]
@@ -53,8 +53,8 @@ def transform(df):
     print(f"Removidas {before - len(df_out)} linhas nulas. Total: {len(df_out)}")
     df_out = df_out.sort_values("data", ascending=False).reset_index(drop=True)
     return df_out
-
-
+ 
+ 
 def ensure_dataset_and_table(client):
     dataset_ref = bigquery.Dataset(f"{PROJECT_ID}.{DATASET}")
     dataset_ref.location = "EU"
@@ -77,8 +77,8 @@ def ensure_dataset_and_table(client):
     except Exception:
         client.create_table(table_obj)
         print(f"Tabela '{TABLE}' criada.")
-
-
+ 
+ 
 def load_to_bq(client, df):
     job_config = bigquery.LoadJobConfig(
         schema=[
@@ -94,15 +94,16 @@ def load_to_bq(client, df):
     job.result()
     table = client.get_table(TABLE_REF)
     print(f"Carga concluida. Tabela tem {table.num_rows} linhas.")
-
-
+ 
+ 
 def main():
     client = bigquery.Client(project=PROJECT_ID)
     df_raw = download_excel(EXCEL_URL)
     df_clean = transform(df_raw)
     ensure_dataset_and_table(client)
     load_to_bq(client, df_clean)
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
+ 
