@@ -18,13 +18,27 @@ PAGE_URL = "https://goldensgf.pt/informacao-dos-fundos/"
 MEDIA_API = "https://goldensgf.pt/wp-json/wp/v2/media"
 FALLBACK_URL = "https://goldensgf.pt/wp-content/uploads/2026/09/Historico-de-Cotacoes_0916.xlsx"
 
-FUND_NAME = "SGF DR FINANÇAS"
-MIN_ROWS = 100
+# Grafia exacta como aparece na coluna "Nome do Fundo" do Excel. A comparacao
+# ignora acentos e maiusculas, mas e este o valor que fica gravado no BigQuery.
+FUNDS = [
+    "SGF DR FINANÇAS",
+    "Golden SGF Poupança Dinamica",
+    "Golden SGF ETF Start",
+    "Golden SGF ETF Plus",
+    "PPR SGF Stoik",
+    "Golden SGF TOP GESTORES",
+]
+
+# A tabela original continua a receber so o DR Financas, para nao partir nada
+# que ja dependa dela. Os seis fundos vao para a tabela nova.
+LEGACY_FUND = "SGF DR FINANÇAS"
+TABLE_LEGACY = "sgf_dr_financas_nav"
+TABLE_ALL = "sgf_navs"
+
+MIN_ROWS_POR_FUNDO = 100
 
 PROJECT_ID = os.environ["GCP_PROJECT_ID"]
 DATASET = "PPR_SGF_DF"
-TABLE = "sgf_dr_financas_nav"
-TABLE_REF = f"{PROJECT_ID}.{DATASET}.{TABLE}"
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
@@ -34,6 +48,10 @@ SCHEMA = [
     bigquery.SchemaField("fundo", "STRING"),
     bigquery.SchemaField("data_extracao", "TIMESTAMP"),
 ]
+
+
+def table_ref(table):
+    return f"{PROJECT_ID}.{DATASET}.{table}"
 
 
 def norm(value):
@@ -166,15 +184,17 @@ def transform(df):
     df.columns = [str(c).strip() for c in df.columns]
     col_fundo, col_nav, col_data = pick_columns(df)
 
-    alvo = norm(FUND_NAME)
-    mask = df[col_fundo].map(norm) == alvo
-    df_filtered = df[mask].copy()
-    print(f"Registos apos filtro '{FUND_NAME}': {len(df_filtered)}")
+    # norm(nome do ficheiro) -> grafia canonica que fica no BigQuery
+    canonico = {norm(f): f for f in FUNDS}
+
+    fundos_norm = df[col_fundo].map(norm)
+    df_filtered = df[fundos_norm.isin(set(canonico))].copy()
+    print(f"Registos dos {len(FUNDS)} fundos pedidos: {len(df_filtered)}")
 
     if df_filtered.empty:
         disponiveis = sorted(set(df[col_fundo].dropna().astype(str)))
         print(f"Fundos disponiveis no ficheiro: {disponiveis}")
-        raise ValueError(f"Fundo '{FUND_NAME}' nao encontrado.")
+        raise ValueError("Nenhum dos fundos pedidos foi encontrado.")
 
     serie_data = df_filtered[col_data]
     if pd.api.types.is_datetime64_any_dtype(serie_data):
@@ -185,7 +205,7 @@ def transform(df):
     df_out = pd.DataFrame()
     df_out["data"] = datas.dt.date
     df_out["nav"] = pd.to_numeric(df_filtered[col_nav], errors="coerce")
-    df_out["fundo"] = FUND_NAME
+    df_out["fundo"] = fundos_norm.loc[df_filtered.index].map(canonico)
     df_out["data_extracao"] = datetime.now(timezone.utc)
 
     before = len(df_out)
@@ -193,67 +213,93 @@ def transform(df):
     print(f"Removidas {before - len(df_out)} linhas nulas. Total: {len(df_out)}")
 
     before = len(df_out)
-    df_out = df_out.drop_duplicates(subset=["data"], keep="last")
+    df_out = df_out.drop_duplicates(subset=["fundo", "data"], keep="last")
     if before != len(df_out):
-        print(f"Removidas {before - len(df_out)} datas duplicadas.")
+        print(f"Removidas {before - len(df_out)} duplicadas (mesmo fundo e data).")
 
-    df_out = df_out.sort_values("data", ascending=False).reset_index(drop=True)
-    print(f"Intervalo: {df_out['data'].min()} a {df_out['data'].max()}")
+    df_out = df_out.sort_values(["fundo", "data"], ascending=[True, False])
+    df_out = df_out.reset_index(drop=True)
+
+    verificar_fundos(df_out)
     return df_out
 
 
-def ensure_dataset_and_table(client):
+def verificar_fundos(df):
+    """Um fundo que desaparece do ficheiro tem de dar erro, nao passar em silencio."""
+    resumo = df.groupby("fundo").agg(
+        linhas=("data", "size"), inicio=("data", "min"), fim=("data", "max")
+    )
+    print("\nPor fundo:")
+    print(resumo.to_string())
+    print()
+
+    em_falta = [f for f in FUNDS if f not in resumo.index]
+    if em_falta:
+        raise ValueError(f"Fundos nao encontrados no ficheiro: {em_falta}")
+
+    magros = resumo[resumo["linhas"] < MIN_ROWS_POR_FUNDO]
+    if not magros.empty:
+        raise ValueError(
+            f"Fundos com menos de {MIN_ROWS_POR_FUNDO} registos: "
+            f"{list(magros.index)}. Carga abortada."
+        )
+
+
+def ensure_dataset_and_table(client, table):
     dataset_ref = bigquery.Dataset(f"{PROJECT_ID}.{DATASET}")
     dataset_ref.location = "EU"
     try:
         client.get_dataset(dataset_ref)
-        print(f"Dataset '{DATASET}' ja existe.")
     except Exception:
         client.create_dataset(dataset_ref)
         print(f"Dataset '{DATASET}' criado.")
 
+    ref = table_ref(table)
     try:
-        client.get_table(TABLE_REF)
-        print(f"Tabela '{TABLE}' ja existe.")
+        client.get_table(ref)
+        print(f"Tabela '{table}' ja existe.")
     except Exception:
-        client.create_table(bigquery.Table(TABLE_REF, schema=SCHEMA))
-        print(f"Tabela '{TABLE}' criada.")
+        client.create_table(bigquery.Table(ref, schema=SCHEMA))
+        print(f"Tabela '{table}' criada.")
 
 
-def sanity_check(client, df):
+def sanity_check(client, table, df):
     """A carga apaga e reescreve a tabela. Nao o fazer com um ficheiro suspeito."""
-    if len(df) < MIN_ROWS:
-        raise ValueError(f"So {len(df)} registos (minimo {MIN_ROWS}). Carga abortada.")
+    ref = table_ref(table)
     try:
-        existentes = client.get_table(TABLE_REF).num_rows
+        existentes = client.get_table(ref).num_rows
     except Exception:
         return
     if existentes and len(df) < existentes * 0.9:
         raise ValueError(
-            f"O ficheiro traz {len(df)} registos mas a tabela ja tem {existentes}. "
-            "Carga abortada para nao perder historico."
+            f"{table}: o ficheiro traz {len(df)} registos mas a tabela ja tem "
+            f"{existentes}. Carga abortada para nao perder historico."
         )
 
 
-def load_to_bq(client, df):
+def load_to_bq(client, table, df):
+    ref = table_ref(table)
     job_config = bigquery.LoadJobConfig(
         schema=SCHEMA,
         write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
     )
-    print(f"A carregar {len(df)} registos para {TABLE_REF}...")
-    client.load_table_from_dataframe(df, TABLE_REF, job_config=job_config).result()
-    table = client.get_table(TABLE_REF)
-    print(f"Carga concluida. Tabela tem {table.num_rows} linhas.")
+    print(f"A carregar {len(df)} registos para {ref}...")
+    client.load_table_from_dataframe(df, ref, job_config=job_config).result()
+    print(f"Carga concluida. {table} tem {client.get_table(ref).num_rows} linhas.")
 
 
 def main():
     client = bigquery.Client(project=PROJECT_ID)
     url, content = download_excel(resolve_excel_url())
     print(f"Fonte utilizada: {url}")
-    df_clean = transform(read_sheet(content))
-    ensure_dataset_and_table(client)
-    sanity_check(client, df_clean)
-    load_to_bq(client, df_clean)
+
+    df_todos = transform(read_sheet(content))
+    df_legacy = df_todos[df_todos["fundo"] == LEGACY_FUND].reset_index(drop=True)
+
+    for table, df in ((TABLE_ALL, df_todos), (TABLE_LEGACY, df_legacy)):
+        ensure_dataset_and_table(client, table)
+        sanity_check(client, table, df)
+        load_to_bq(client, table, df)
 
 
 if __name__ == "__main__":
