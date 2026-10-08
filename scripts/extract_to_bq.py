@@ -12,14 +12,22 @@ import requests
 from google.cloud import bigquery
 from openpyxl import load_workbook
 
-# O site da SGF foi refeito em Setembro de 2026. O Excel nao tem um URL fixo,
-# por isso o URL e descoberto em cada execucao (pagina publica + API de media
-# do WordPress). Como pode haver mais do que um ficheiro de cotacoes publicado
-# (e um deles desactualizado), descarregam-se TODOS os candidatos e usa-se o
-# que tiver a data mais recente.
-PAGE_URL = "https://goldensgf.pt/informacao-dos-fundos/"
+# O site da SGF foi refeito em Setembro de 2026. O Excel nao tem um URL fixo
+# e ha mais do que um publicado: a pagina "Informacao dos Fundos" aponta para
+# um upload do WordPress (que ficou parado a 02/10/2026) e a pagina "PPRs"
+# aponta para /historico-de-cotacoes.xlsx (o que esta actualizado). Por isso
+# percorrem-se as duas paginas e a API de media, descarregam-se TODOS os
+# candidatos e usa-se o que tiver a data mais recente.
+PAGE_URLS = [
+    "https://goldensgf.pt/pprs/",
+    "https://goldensgf.pt/informacao-dos-fundos/",
+]
 MEDIA_API = "https://goldensgf.pt/wp-json/wp/v2/media"
-FALLBACK_URL = "https://goldensgf.pt/wp-content/uploads/2026/09/Historico-de-Cotacoes_0916.xlsx"
+# URLs conhecidos, testados sempre mesmo que deixem de aparecer nas paginas.
+KNOWN_URLS = [
+    "https://goldensgf.pt/historico-de-cotacoes.xlsx",
+    "https://goldensgf.pt/wp-content/uploads/2026/09/Historico-de-Cotacoes.xlsx",
+]
 
 # Grafia exacta como aparece na coluna "Nome do Fundo" do Excel. A comparacao
 # ignora acentos e maiusculas, mas e este o valor que fica gravado no BigQuery.
@@ -80,7 +88,7 @@ def sem_cache(url):
     return f"{url}{sep}nocache={int(time.time())}"
 
 
-def links_xlsx_da_pagina(html):
+def links_xlsx_da_pagina(html, base_url):
     """Apanha links .xlsx absolutos, relativos e escapados em JSON/JS."""
     html = html.replace("\\/", "/")
     links = []
@@ -99,22 +107,23 @@ def links_xlsx_da_pagina(html):
         html,
         flags=re.IGNORECASE,
     )
-    return [urljoin(PAGE_URL, l.strip()) for l in links]
+    return [urljoin(base_url, l.strip()) for l in links]
 
 
 def resolve_excel_urls():
-    """Junta todos os candidatos: pagina publica + API de media + fallback."""
+    """Junta todos os candidatos: paginas publicas + API de media + URLs conhecidos."""
     candidates = []
 
-    try:
-        print(f"A procurar links do Excel em: {PAGE_URL}")
-        resp = requests.get(sem_cache(PAGE_URL), headers=HEADERS, timeout=60)
-        resp.raise_for_status()
-        encontrados = links_xlsx_da_pagina(resp.text)
-        print(f"  Na pagina: {encontrados}")
-        candidates += encontrados
-    except Exception as e:
-        print(f"Nao foi possivel ler a pagina: {e}")
+    for page_url in PAGE_URLS:
+        try:
+            print(f"A procurar links do Excel em: {page_url}")
+            resp = requests.get(sem_cache(page_url), headers=HEADERS, timeout=60)
+            resp.raise_for_status()
+            encontrados = links_xlsx_da_pagina(resp.text, page_url)
+            print(f"  Na pagina: {encontrados}")
+            candidates += encontrados
+        except Exception as e:
+            print(f"Nao foi possivel ler a pagina {page_url}: {e}")
 
     try:
         print("A consultar a API de media do WordPress...")
@@ -136,7 +145,7 @@ def resolve_excel_urls():
     except Exception as e:
         print(f"API de media falhou: {e}")
 
-    candidates.append(FALLBACK_URL)
+    candidates += KNOWN_URLS
 
     # Ficar so com os ficheiros de cotacoes, sem repetidos, mantendo a ordem.
     cotacoes = [u for u in candidates if "COTAC" in norm(u)]
