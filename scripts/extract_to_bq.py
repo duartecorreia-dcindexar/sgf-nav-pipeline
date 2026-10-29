@@ -49,7 +49,10 @@ TABLE_ALL = "sgf_navs"
 MIN_ROWS_POR_FUNDO = 100
 
 # Validacoes antes de reescrever as tabelas.
-MAX_ATRASO_DIAS = 4        # ultima cotacao comum aos 6 fundos nao pode ter mais de 4 dias
+# O atraso do ficheiro ja nao bloqueia a carga: a SGF chega a ficar mais de uma
+# semana sem actualizar. Carrega-se sempre que o ficheiro traz datas que ainda
+# nao estao no BigQuery; um atraso grande so gera um aviso no GitHub Actions.
+AVISO_ATRASO_DIAS = 4      # acima disto, aviso (nao erro)
 JANELA_REPETIDOS_DIAS = 60 # dias recentes verificados contra todo o historico
 
 TZ_LISBOA = ZoneInfo("Europe/Lisbon")
@@ -329,18 +332,63 @@ def escolher_melhor_ficheiro(urls):
     return url, df
 
 
-def verificar_atraso(df):
-    """Nao reescrever a tabela com um ficheiro parado no tempo."""
+def ultimas_datas_bq(client):
+    """Ultima data de cada fundo ja carregada no BigQuery (vazio se nao houver tabela)."""
+    query = f"""
+        SELECT fundo, MAX(data) AS fim
+        FROM `{table_ref(TABLE_ALL)}`
+        GROUP BY fundo
+    """
+    try:
+        return {row["fundo"]: row["fim"] for row in client.query(query).result()}
+    except Exception as e:
+        print(f"Nao foi possivel ler as datas ja carregadas ({e}); segue como tabela vazia.")
+        return {}
+
+
+def tem_datas_novas(client, df):
+    """Decide se vale a pena carregar: so quando o ficheiro traz datas que o BigQuery ainda nao tem.
+
+    Sem datas novas, o script termina sem erro e as tabelas ficam como estavam.
+    Um ficheiro mais antigo do que o que ja esta carregado (cache, upload antigo)
+    tambem nao entra, para nunca andar para tras.
+    """
     hoje = datetime.now(TZ_LISBOA).date()
-    fim = ultima_data_comum(df)
-    atraso = (hoje - fim).days
-    print(f"Ultima cotacao comum: {fim} ({atraso} dias de atraso).")
-    if atraso > MAX_ATRASO_DIAS:
-        raise ValueError(
-            f"O ficheiro mais recente acaba em {fim} ({atraso} dias de atraso, "
-            f"maximo {MAX_ATRASO_DIAS}). Possivel ficheiro desactualizado ou em "
-            f"cache. Carga abortada; as tabelas ficam como estavam."
+    fim_ficheiro = ultima_data_comum(df)
+    atraso = (hoje - fim_ficheiro).days
+    print(f"Ultima cotacao comum no ficheiro: {fim_ficheiro} ({atraso} dias de atraso).")
+    if atraso > AVISO_ATRASO_DIAS:
+        print(
+            f"::warning::A SGF ainda nao publicou cotacoes depois de {fim_ficheiro} "
+            f"({atraso} dias de atraso)."
         )
+
+    fim_bq = ultimas_datas_bq(client)
+    if not fim_bq:
+        print("BigQuery sem dados: carga completa.")
+        return True
+
+    fim_comum_bq = min(fim_bq.values())
+    print(f"Ultima cotacao comum no BigQuery: {fim_comum_bq}.")
+    if fim_ficheiro < fim_comum_bq:
+        print(
+            f"O ficheiro ({fim_ficheiro}) e mais antigo do que o BigQuery "
+            f"({fim_comum_bq}). Nada a carregar."
+        )
+        return False
+
+    fim_por_fundo = df.groupby("fundo")["data"].max()
+    novos = {
+        fundo: fim
+        for fundo, fim in fim_por_fundo.items()
+        if fundo not in fim_bq or fim > fim_bq[fundo]
+    }
+    if not novos:
+        print("Sem datas novas no ficheiro. Nada a carregar; as tabelas ficam como estavam.")
+        return False
+
+    print(f"Datas novas encontradas: {novos}")
+    return True
 
 
 def verificar_dias_repetidos(df):
@@ -413,7 +461,8 @@ def main():
     client = bigquery.Client(project=PROJECT_ID)
 
     url, df_todos = escolher_melhor_ficheiro(resolve_excel_urls())
-    verificar_atraso(df_todos)
+    if not tem_datas_novas(client, df_todos):
+        return
     verificar_dias_repetidos(df_todos)
 
     df_legacy = df_todos[df_todos["fundo"] == LEGACY_FUND].reset_index(drop=True)
